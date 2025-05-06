@@ -1,161 +1,145 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
-import winston from 'winston';
 
-// Configure logger for security audit
-const securityLogger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.File({ filename: 'logs/security-audit.log' })
-  ]
-});
-
-interface NonceStore {
-  [key: string]: {
-    timestamp: number;
-    used: boolean;
-    ip?: string;
-  };
-}
-
-const NONCE_TIMEOUT_SECONDS = 300; // 5 minutes
+// Configuration Constants
+const NONCE_TIMEOUT_MS = 300000; // 5 minutes
 const MAX_NONCE_STORE_SIZE = 10000; // Prevent memory exhaustion
-const nonceStore: NonceStore = {};
+const NONCE_LENGTH = 64; // Recommended nonce length
 
-/**
- * Generate a cryptographically secure random nonce
- * @returns {string} A unique nonce
- */
-export function generateNonce(): string {
-  return crypto.randomBytes(32).toString('hex');
+// Logging interface to allow flexible logging strategies
+interface NonceLogger {
+  log(level: 'info' | 'warn' | 'error', message: string, context?: Record<string, any>): void;
 }
 
-/**
- * Clean up expired and excess nonces
- */
-function cleanupNonces(): void {
-  const now = Date.now();
-  const keysToRemove = Object.keys(nonceStore)
-    .filter(key => 
-      now - nonceStore[key].timestamp > NONCE_TIMEOUT_SECONDS * 1000
-    );
-
-  keysToRemove.forEach(key => delete nonceStore[key]);
-
-  // Prevent potential memory exhaustion
-  if (Object.keys(nonceStore).length > MAX_NONCE_STORE_SIZE) {
-    const oldestKeys = Object.keys(nonceStore)
-      .sort((a, b) => nonceStore[a].timestamp - nonceStore[b].timestamp)
-      .slice(0, Object.keys(nonceStore).length - MAX_NONCE_STORE_SIZE);
-    
-    oldestKeys.forEach(key => delete nonceStore[key]);
+// Minimal default logger if no external logger is provided
+class ConsoleNonceLogger implements NonceLogger {
+  log(level: 'info' | 'warn' | 'error', message: string, context?: Record<string, any>): void {
+    const formattedContext = context ? ` ${JSON.stringify(context)}` : '';
+    console[level](`[Nonce ${level.toUpperCase()}] ${message}${formattedContext}`);
   }
 }
 
-/**
- * Validate a nonce for request authentication
- * @param nonce The nonce to validate
- * @param ip Client IP address
- * @returns {boolean} Whether the nonce is valid
- */
-export function validateNonce(nonce: string, ip?: string): boolean {
-  // Perform cleanup
-  cleanupNonces();
-
-  // Check if nonce exists and hasn't been used
-  if (!nonceStore[nonce]) {
-    securityLogger.warn({
-      message: 'Invalid nonce: Not found',
-      nonce,
-      ip
-    });
-    return false;
-  }
-
-  if (nonceStore[nonce].used) {
-    securityLogger.warn({
-      message: 'Invalid nonce: Already used',
-      nonce,
-      ip
-    });
-    return false;
-  }
-
-  // Optional: Add IP validation if provided
-  if (ip && nonceStore[nonce].ip && nonceStore[nonce].ip !== ip) {
-    securityLogger.warn({
-      message: 'Invalid nonce: IP mismatch',
-      nonce,
-      expectedIp: nonceStore[nonce].ip,
-      actualIp: ip
-    });
-    return false;
-  }
-
-  // Mark nonce as used
-  nonceStore[nonce].used = true;
-
-  securityLogger.info({
-    message: 'Nonce validated successfully',
-    nonce,
-    ip
-  });
-
-  return true;
+interface NonceEntry {
+  timestamp: number;
+  used: boolean;
+  ipAddress?: string;
 }
 
-/**
- * Middleware to generate a nonce for authentication
- */
-export const nonceGenerationMiddleware = (req: Request, res: Response, next: NextFunction) => {
-  const nonce = generateNonce();
-  const clientIp = req.ip;
-  
-  // Store nonce with timestamp and optional IP
-  nonceStore[nonce] = {
-    timestamp: Date.now(),
-    used: false,
-    ip: clientIp
-  };
+class NonceMiddleware {
+  private nonceStore: Map<string, NonceEntry>;
+  private logger: NonceLogger;
 
-  securityLogger.info({
-    message: 'Nonce generated',
-    nonce,
-    ip: clientIp
-  });
-
-  res.locals.nonce = nonce;
-  next();
-};
-
-/**
- * Middleware to validate the nonce in the request
- */
-export const nonceValidationMiddleware = (req: Request, res: Response, next: NextFunction) => {
-  const nonce = req.headers['x-nonce'] as string;
-  const clientIp = req.ip;
-
-  if (!nonce) {
-    securityLogger.error({
-      message: 'Nonce validation failed: Missing nonce',
-      ip: clientIp
-    });
-    return res.status(400).json({ 
-      error: 'Nonce is required',
-      code: 'NONCE_MISSING' 
-    });
+  constructor(logger?: NonceLogger) {
+    this.nonceStore = new Map();
+    this.logger = logger || new ConsoleNonceLogger();
   }
 
-  if (!validateNonce(nonce, clientIp)) {
-    return res.status(401).json({ 
-      error: 'Invalid or expired nonce',
-      code: 'NONCE_INVALID' 
-    });
+  /**
+   * Generate a cryptographically secure nonce
+   */
+  generateNonce(): string {
+    return crypto.randomBytes(NONCE_LENGTH / 2).toString('hex');
   }
 
-  next();
-};
+  /**
+   * Clean up expired and excess nonces
+   */
+  private cleanupNonces(): void {
+    const now = Date.now();
+    const excessNonces = Array.from(this.nonceStore.entries())
+      .filter(([_, entry]) => now - entry.timestamp > NONCE_TIMEOUT_MS);
+
+    excessNonces.forEach(([nonce]) => this.nonceStore.delete(nonce));
+
+    if (this.nonceStore.size > MAX_NONCE_STORE_SIZE) {
+      const oldestNonces = Array.from(this.nonceStore.entries())
+        .sort((a, b) => a[1].timestamp - b[1].timestamp)
+        .slice(0, this.nonceStore.size - MAX_NONCE_STORE_SIZE);
+
+      oldestNonces.forEach(([nonce]) => this.nonceStore.delete(nonce));
+    }
+  }
+
+  /**
+   * Validate a nonce with optional IP verification
+   */
+  validateNonce(nonce: string, ipAddress?: string): boolean {
+    this.cleanupNonces();
+
+    const nonceEntry = this.nonceStore.get(nonce);
+
+    if (!nonceEntry) {
+      this.logger.log('warn', 'Invalid nonce: Not found', { nonce, ipAddress });
+      return false;
+    }
+
+    if (nonceEntry.used) {
+      this.logger.log('warn', 'Invalid nonce: Already used', { nonce, ipAddress });
+      return false;
+    }
+
+    if (ipAddress && nonceEntry.ipAddress && nonceEntry.ipAddress !== ipAddress) {
+      this.logger.log('warn', 'Invalid nonce: IP mismatch', { 
+        nonce, 
+        expectedIp: nonceEntry.ipAddress, 
+        actualIp: ipAddress 
+      });
+      return false;
+    }
+
+    // Mark nonce as used
+    nonceEntry.used = true;
+    this.logger.log('info', 'Nonce validated successfully', { nonce, ipAddress });
+    return true;
+  }
+
+  /**
+   * Middleware to generate a nonce
+   */
+  nonceGenerationMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+    const nonce = this.generateNonce();
+    const ipAddress = req.ip;
+
+    this.nonceStore.set(nonce, {
+      timestamp: Date.now(),
+      used: false,
+      ipAddress
+    });
+
+    this.logger.log('info', 'Nonce generated', { nonce, ipAddress });
+    res.locals.nonce = nonce;
+    next();
+  }
+
+  /**
+   * Middleware to validate nonce
+   */
+  nonceValidationMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+    const nonce = req.headers['x-nonce'] as string;
+    const ipAddress = req.ip;
+
+    if (!nonce) {
+      this.logger.log('error', 'Nonce validation failed: Missing nonce', { ipAddress });
+      return res.status(400).json({ 
+        error: 'Nonce is required',
+        code: 'NONCE_MISSING'
+      });
+    }
+
+    if (!this.validateNonce(nonce, ipAddress)) {
+      return res.status(401).json({ 
+        error: 'Invalid or expired nonce',
+        code: 'NONCE_INVALID'
+      });
+    }
+
+    next();
+  }
+}
+
+// Export a singleton instance
+export const nonceMiddleware = new NonceMiddleware();
+export const { 
+  nonceGenerationMiddleware, 
+  nonceValidationMiddleware 
+} = nonceMiddleware;
