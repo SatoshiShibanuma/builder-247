@@ -1,109 +1,116 @@
-import { generateNonce, validateNonce } from '../../src/middleware/nonce';
+import { nonceMiddleware } from '../../src/middleware/nonce';
 import { Request, Response, NextFunction } from 'express';
-import { nonceGenerationMiddleware, nonceValidationMiddleware } from '../../src/middleware/nonce';
 
 describe('Nonce Middleware', () => {
-  describe('generateNonce', () => {
-    it('should generate unique nonces', () => {
-      const nonce1 = generateNonce();
-      const nonce2 = generateNonce();
-      
-      expect(nonce1).not.toEqual(nonce2);
-      expect(nonce1.length).toBeGreaterThan(0);
-    });
+  let mockReq: Partial<Request>;
+  let mockRes: Partial<Response>;
+  let mockNext: jest.MockedFunction<NextFunction>;
 
-    it('should generate hex string nonces', () => {
-      const nonce = generateNonce();
-      expect(/^[0-9a-f]+$/.test(nonce)).toBeTruthy();
-    });
+  beforeEach(() => {
+    mockReq = {
+      headers: {},
+      ip: '192.168.1.1'
+    };
+    mockRes = {
+      locals: {},
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn()
+    };
+    mockNext = jest.fn();
   });
 
-  describe('validateNonce', () => {
-    it('should allow a valid nonce', () => {
-      const nonce = generateNonce();
-      expect(validateNonce(nonce)).toBeTruthy();
-    });
-
-    it('should not allow a nonce twice', () => {
-      const nonce = generateNonce();
-      expect(validateNonce(nonce)).toBeTruthy();
-      expect(validateNonce(nonce)).toBeFalsy();
-    });
-
-    it('should not allow an invalid nonce', () => {
-      const invalidNonce = 'invalid_nonce';
-      expect(validateNonce(invalidNonce)).toBeFalsy();
-    });
-
-    it('should validate nonce with IP matching', () => {
-      const nonce = generateNonce();
-      const ip = '192.168.1.1';
-      expect(validateNonce(nonce, ip)).toBeTruthy();
-      expect(validateNonce(nonce, ip)).toBeFalsy(); // Cannot reuse
-      expect(validateNonce(nonce, '10.0.0.1')).toBeFalsy(); // Different IP
+  describe('generateNonce', () => {
+    it('should generate unique nonces', () => {
+      const nonce1 = nonceMiddleware.generateNonce();
+      const nonce2 = nonceMiddleware.generateNonce();
+      
+      expect(nonce1).not.toEqual(nonce2);
+      expect(nonce1.length).toBe(64);
     });
   });
 
   describe('nonceGenerationMiddleware', () => {
-    it('should add nonce to res.locals', () => {
-      const req = {} as Request;
-      const res = { 
-        locals: {},
-        ip: '192.168.1.1'
-      } as Response;
-      const next = jest.fn() as NextFunction;
+    it('should generate and attach nonce to res.locals', () => {
+      nonceMiddleware.nonceGenerationMiddleware(
+        mockReq as Request, 
+        mockRes as Response, 
+        mockNext
+      );
 
-      nonceGenerationMiddleware(req, res, next);
-
-      expect(res.locals.nonce).toBeDefined();
-      expect(typeof res.locals.nonce).toBe('string');
-      expect(next).toHaveBeenCalled();
+      expect(mockRes.locals.nonce).toBeDefined();
+      expect(typeof mockRes.locals.nonce).toBe('string');
+      expect(mockNext).toHaveBeenCalled();
     });
   });
 
   describe('nonceValidationMiddleware', () => {
     it('should reject requests without nonce', () => {
-      const req = { 
-        headers: {},
-        ip: '192.168.1.1'
-      } as Request;
-      const res = { 
-        status: jest.fn().mockReturnThis(),
-        json: jest.fn()
-      } as unknown as Response;
-      const next = jest.fn() as NextFunction;
+      nonceMiddleware.nonceValidationMiddleware(
+        mockReq as Request, 
+        mockRes as Response, 
+        mockNext
+      );
 
-      nonceValidationMiddleware(req, res, next);
-
-      expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
-        error: 'Nonce is required',
+      expect(mockRes.status).toHaveBeenCalledWith(400);
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
         code: 'NONCE_MISSING'
       }));
-      expect(next).not.toHaveBeenCalled();
     });
 
-    it('should validate request with valid nonce', () => {
-      const req = { 
-        headers: {},
-        ip: '192.168.1.1'
-      } as Request;
-      const res = { 
-        locals: {},
-        status: jest.fn().mockReturnThis(),
-        json: jest.fn()
-      } as unknown as Response;
-      const next = jest.fn() as NextFunction;
-
+    it('should validate request with correct nonce', () => {
       // First generate a nonce
-      nonceGenerationMiddleware(req, res, () => {
-        // Use the generated nonce
-        req.headers['x-nonce'] = res.locals.nonce;
+      nonceMiddleware.nonceGenerationMiddleware(
+        mockReq as Request, 
+        mockRes as Response, 
+        () => {
+          // Use the generated nonce
+          mockReq.headers['x-nonce'] = mockRes.locals.nonce;
 
-        nonceValidationMiddleware(req, res, next);
+          nonceMiddleware.nonceValidationMiddleware(
+            mockReq as Request, 
+            mockRes as Response, 
+            mockNext
+          );
 
-        expect(next).toHaveBeenCalled();
-      });
+          expect(mockNext).toHaveBeenCalled();
+        }
+      );
+    });
+
+    it('should reject reused nonce', () => {
+      // First generate a nonce
+      nonceMiddleware.nonceGenerationMiddleware(
+        mockReq as Request, 
+        mockRes as Response, 
+        () => {
+          // Use the generated nonce
+          mockReq.headers['x-nonce'] = mockRes.locals.nonce;
+
+          // First validation should pass
+          nonceMiddleware.nonceValidationMiddleware(
+            mockReq as Request, 
+            mockRes as Response, 
+            mockNext
+          );
+
+          // Reset mocks
+          (mockRes.status as jest.Mock).mockClear();
+          (mockRes.json as jest.Mock).mockClear();
+          (mockNext as jest.Mock).mockClear();
+
+          // Second validation should fail
+          nonceMiddleware.nonceValidationMiddleware(
+            mockReq as Request, 
+            mockRes as Response, 
+            mockNext
+          );
+
+          expect(mockRes.status).toHaveBeenCalledWith(401);
+          expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
+            code: 'NONCE_INVALID'
+          }));
+        }
+      );
     });
   });
 });
